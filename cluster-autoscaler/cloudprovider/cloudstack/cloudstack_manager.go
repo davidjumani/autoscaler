@@ -23,9 +23,11 @@ import (
 	"strings"
 	"sync"
 
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/cloudstack/service"
+	"k8s.io/autoscaler/cluster-autoscaler/config"
+
 	apiv1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/autoscaler/cluster-autoscaler/config"
 )
 
 type acsConfig struct {
@@ -34,120 +36,98 @@ type acsConfig struct {
 	Endpoint  string
 }
 
-type cloudStackManager struct {
+type manager struct {
 	clusterID      string
-	cluster        *cluster
-	config         *acsConfig
-	client         cloudStackClient
+	asg            *asg
+	service        service.CKSService
 	mux            sync.Mutex
 	maxClusterSize int
 	minClusterSize int
 }
 
-func (manager *cloudStackManager) clusterForNode(node *v1.Node) (*cluster, error) {
-	_, err := manager.cluster.Belongs(node)
+func (manager *manager) clusterForNode(node *v1.Node) (*asg, error) {
+	_, err := manager.asg.Belongs(node)
 	if err != nil {
 		return nil, err
 	}
-	return manager.cluster, nil
+	return manager.asg, nil
 }
 
-func (manager *cloudStackManager) refresh() error {
+func (manager *manager) refresh() error {
 	return manager.fetchCluster()
 }
 
-func (manager *cloudStackManager) cleanup() error {
+func (manager *manager) cleanup() error {
+	manager.service.Close()
 	manager.mux.Lock()
 	defer manager.mux.Unlock()
 	return nil
 }
 
-func (manager *cloudStackManager) fetchCluster() error {
+// func (manager *manager) setUp
+
+func (manager *manager) fetchCluster() error {
 	manager.mux.Lock()
 	defer manager.mux.Unlock()
 
-	var response listClusterResponse
-	_, err := manager.client.NewAPIRequest("listKubernetesClusters", map[string]string{
-		"id": manager.clusterID,
-	}, false, &response)
+	// TODO : Maybe instead hit an api to say that autoscaling is enabled ?
+	cluster, err := manager.service.GetClusterDetails(manager.clusterID)
 	if err != nil {
-		return fmt.Errorf("Unable to fetch cluster details : %v", err)
+		return err
 	}
 
-	clusters := response.ClustersResponse.Clusters
-	if len(clusters) == 0 {
-		return fmt.Errorf("Unable to fetch cluster with id : %v", manager.clusterID)
-	}
-
-	cluster := clusters[0]
 	fmt.Println("Got cluster : ", cluster)
-	cluster.Currentsize = cluster.MasterCount + cluster.WorkerCount
-	cluster.Maxsize = manager.maxClusterSize
-	cluster.Minsize = manager.minClusterSize
-	cluster.manager = manager
+	// TODO : Maybe move this all to a separate function ?
+	manager.asg.Copy(cluster, manager)
+	manager.asg.maxSize = manager.maxClusterSize
+	manager.asg.minSize = manager.minClusterSize
 
-	manager.cluster = cluster
 	return nil
 }
 
-func (manager *cloudStackManager) scaleCluster(delta int) (int, error) {
+func (manager *manager) scaleCluster(workerCount int) (int, error) {
 	manager.mux.Lock()
 	defer manager.mux.Unlock()
 
-	var out clusterResponse
-	_, err := manager.client.NewAPIRequest("scaleKubernetesCluster", map[string]string{
-		"id":   manager.clusterID,
-		"size": strconv.Itoa(manager.cluster.Currentsize + delta),
-	}, true, &out)
+	cluster, err := manager.service.ScaleCluster(manager.clusterID, workerCount)
 	if err != nil {
-		err = fmt.Errorf("Unable to scale cluster : %v", err)
 		return 0, err
 	}
-	fmt.Println("Scaled up cluster : ", out.Cluster)
-	cluster := out.Cluster
-	cluster.Currentsize = cluster.MasterCount + cluster.WorkerCount
-	cluster.Maxsize = manager.maxClusterSize
-	cluster.Minsize = manager.minClusterSize
-	cluster.manager = manager
+	fmt.Println("Scaled up cluster : ", cluster)
+	manager.asg.Copy(cluster, manager)
+	manager.asg.maxSize = manager.maxClusterSize
+	manager.asg.minSize = manager.minClusterSize
 
-	manager.cluster = cluster
-	return len(manager.cluster.VMs), nil
+	return len(manager.asg.instances), nil
 }
 
-func (manager *cloudStackManager) deleteNodes(nodes []*apiv1.Node) (int, error) {
+func (manager *manager) deleteNodes(nodes []*apiv1.Node) (int, error) {
 	manager.mux.Lock()
 	defer manager.mux.Unlock()
 
 	nodeIDs := make([]string, len(nodes))
 	for _, node := range nodes {
-		if !strings.Contains(node.Name, "-master-") {
-			nodeIDs = append(nodeIDs, node.Status.NodeInfo.SystemUUID)
-		} else {
-			fmt.Println("Trying to remove the master node!!!!!!")
-		}
+		nodeIDs = append(nodeIDs, node.Status.NodeInfo.SystemUUID)
 	}
 
-	var out clusterResponse
-	_, err := manager.client.NewAPIRequest("scaleKubernetesCluster", map[string]string{
-		"nodeids": strings.Join(nodeIDs[:], ","),
-	}, true, &out)
+	if len(nodeIDs) == 0 {
+		return 0, fmt.Errorf("Unable to fetch nodeids from %v", nodes)
+	}
+
+	cluster, err := manager.service.RemoveNodesFromCluster(manager.clusterID, nodeIDs)
 	if err != nil {
-		err = fmt.Errorf("Unable to delete %v from cluster : %v", nodeIDs, err)
 		return 0, err
 	}
-	fmt.Println("Scaled down cluster : ", out.Cluster)
+	fmt.Println("Scaled down cluster : ", cluster)
 
-	cluster := out.Cluster
-	cluster.Currentsize = cluster.MasterCount + cluster.WorkerCount
-	cluster.Maxsize = manager.maxClusterSize
-	cluster.Minsize = manager.minClusterSize
-	cluster.manager = manager
+	manager.asg.Copy(cluster, manager)
+	manager.asg.maxSize = manager.maxClusterSize
+	manager.asg.minSize = manager.minClusterSize
 
-	manager.cluster = cluster
-	return len(manager.cluster.VMs), nil
+	return len(manager.asg.instances), nil
 }
 
-func newManager(opts config.AutoscalingOptions) (*cloudStackManager, error) {
+func newManager(opts config.AutoscalingOptions) (*manager, error) {
 	apiKey, ok := os.LookupEnv("API_KEY")
 	if !ok {
 		return nil, fmt.Errorf("API_KEY environment variable not set")
@@ -163,11 +143,6 @@ func newManager(opts config.AutoscalingOptions) (*cloudStackManager, error) {
 		return nil, fmt.Errorf("ENDPOINT environment variable not set")
 	}
 
-	// clusterID, ok := os.LookupEnv("CLUSTER_ID")
-	// if !ok {
-	// 	return nil, fmt.Errorf("CLUSTER_ID environment variable not set")
-	// }
-
 	if len(opts.NodeGroups) == 0 {
 		return nil, fmt.Errorf("Cluster details not present. Please use the --nodes=<min>:<max>:<id>")
 	}
@@ -177,7 +152,7 @@ func newManager(opts config.AutoscalingOptions) (*cloudStackManager, error) {
 		return nil, fmt.Errorf("Cluster details not present. Please use the --nodes=<min>:<max>:<id>")
 	}
 
-	config := &acsConfig{
+	config := &service.Config{
 		APIKey:    apiKey,
 		SecretKey: secretKey,
 		Endpoint:  endpoint,
@@ -193,12 +168,12 @@ func newManager(opts config.AutoscalingOptions) (*cloudStackManager, error) {
 		return nil, fmt.Errorf("Invalid value for max cluster size %s : %v", clusterDetails[1], err)
 	}
 
-	manager := &cloudStackManager{
-		config:         config,
-		client:         newClient(config),
+	manager := &manager{
+		service:        service.NewCKSService(config),
 		minClusterSize: minClusterSize,
 		maxClusterSize: maxClusterSize,
 		clusterID:      clusterDetails[2],
+		asg:            &asg{},
 	}
 	manager.refresh()
 	return manager, nil

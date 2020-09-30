@@ -41,7 +41,7 @@ var (
 
 // cloudStackCloudProvider implements CloudProvider interface.
 type cloudStackCloudProvider struct {
-	manager         *cloudStackManager
+	manager         *manager
 	resourceLimiter *cloudprovider.ResourceLimiter
 }
 
@@ -65,19 +65,22 @@ func (provider *cloudStackCloudProvider) Name() string {
 // NodeGroups returns all node groups configured for this cloud provider.
 func (provider *cloudStackCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 	// fmt.Println("NodeGroups")
-	cluster := provider.manager.cluster
-	return []cloudprovider.NodeGroup{cluster}
+	asg := provider.manager.asg
+	return []cloudprovider.NodeGroup{asg}
 }
 
 // NodeGroupForNode returns the node group for the given node, nil if the node
 // should not be processed by cluster autoscaler, or non-nil error if such
-// occurred. Must be implemented.
+// occurred.
 func (provider *cloudStackCloudProvider) NodeGroupForNode(node *v1.Node) (cloudprovider.NodeGroup, error) {
 	// b, _ := json.Marshal(node)
 	// fmt.Println("NodeGroupForNode Begin : ")
-	a, b := provider.manager.clusterForNode(node)
+	// a, b := provider.manager.clusterForNode(node)
 	// fmt.Println(" NodeGroupForNode End : ", a, b)
-	return a, b
+	// return a, b
+
+	// TODO : Maybe return nil for master nodes ?
+	return provider.manager.clusterForNode(node)
 }
 
 // Pricing returns pricing model for this cloud provider or error if not available.

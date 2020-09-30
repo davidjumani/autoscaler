@@ -168,6 +168,3 @@ spec:
                 secretKeyRef:
                   name: cloud-config
                   key: secret-key
-
-      # kubectl apply -f https://k8s.io/examples/application/php-apache.yaml
-      # kubectl autoscale deployment php-apache --cpu-percent=5 --min=1 --max=30

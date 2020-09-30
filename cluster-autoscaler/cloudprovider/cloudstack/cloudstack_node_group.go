@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/cloudstack/service"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -28,66 +29,69 @@ import (
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 )
 
-// cluster implements NodeGroup interface.
-type cluster struct {
-	UUID        string `json:"id"`
-	Name        string `json:"name"`
-	Minsize     int    `json:"minsize"`
-	Maxsize     int    `json:"maxsize"`
-	WorkerCount int    `json:"size"`
-	MasterCount int    `json:"masternodes"`
-	Currentsize int
-	VMs         []*node `json:"virtualmachines"`
-	manager     *cloudStackManager
+// asg implements NodeGroup interface.
+type asg struct {
+	uuid            string
+	name            string
+	minSize         int
+	maxSize         int
+	masterNodesSize int
+	workerNodesSize int
+	currentSize     int
+	instances       []cloudprovider.Instance
+	manager         *manager
 }
 
-type node struct {
-	Id    string `json:"id"`
-	Name  string `json:"name"`
-	State string `json:"state"`
+func (asg *asg) Copy(cluster *service.Cluster, manager *manager) {
+	asg.uuid = cluster.ID
+	asg.name = cluster.Name
+	asg.minSize = cluster.Minsize
+	asg.maxSize = cluster.Maxsize
+	asg.masterNodesSize = cluster.MasterCount
+	asg.workerNodesSize = cluster.WorkerCount
+	asg.currentSize = cluster.WorkerCount + cluster.MasterCount
+	asg.manager = manager
+	instances := make([]cloudprovider.Instance, len(cluster.VirtualMachines))
+	for i := 0; i < len(cluster.VirtualMachines); i++ {
+		instances[i] = cloudprovider.Instance{
+			Id: cluster.VirtualMachines[i].ID,
+			// Status: cluster.VMs[i].State,
+		}
+	}
+	asg.instances = instances
 }
 
 // MaxSize returns maximum size of the node group.
-func (cluster *cluster) MaxSize() int {
-	return cluster.Maxsize
+func (asg *asg) MaxSize() int {
+	return asg.maxSize
 }
 
 // MinSize returns minimum size of the node group.
-func (cluster *cluster) MinSize() int {
-	return cluster.Minsize
+func (asg *asg) MinSize() int {
+	return asg.minSize
 }
 
 // TargetSize returns the current TARGET size of the node group. It is possible that the
 // number is different from the number of nodes registered in Kubernetes.
-func (cluster *cluster) TargetSize() (int, error) {
-	return cluster.Currentsize, nil
-}
-
-func (cluster *cluster) scaleCluster(delta int) (int, error) {
-	return cluster.manager.scaleCluster(delta)
+func (asg *asg) TargetSize() (int, error) {
+	return asg.currentSize, nil
 }
 
 // IncreaseSize increases cluster size
-func (cluster *cluster) IncreaseSize(delta int) error {
+func (asg *asg) IncreaseSize(delta int) error {
 
 	fmt.Println("IncreaseSize : ", delta)
 
-	klog.Infof("increase cluster:%s with %d nodes", cluster.UUID, delta)
+	klog.Infof("Increase Cluster :%s by %d", asg.uuid, delta)
 	if delta <= 0 {
-		return fmt.Errorf("size increase must be positive")
+		return fmt.Errorf("Delta must be positive")
 	}
-	if cluster.Currentsize+delta > cluster.Maxsize {
-		return fmt.Errorf("size increase is too large - desired : %d max : %d", cluster.Currentsize+delta, cluster.Maxsize)
-	}
-
-	// TODO : Return the new cluster and copy everything!
-	size, err := cluster.scaleCluster(delta)
-	if err != nil {
-		return err
+	if asg.currentSize+delta > asg.maxSize {
+		return fmt.Errorf("Delta too large - Wanted : %d Max : %d", asg.currentSize+delta, asg.maxSize)
 	}
 
-	cluster.Currentsize = size
-	return nil
+	_, err := asg.manager.scaleCluster(asg.workerNodesSize + delta)
+	return err
 }
 
 // DecreaseTargetSize decreases the target size of the node group. This function
@@ -95,15 +99,15 @@ func (cluster *cluster) IncreaseSize(delta int) error {
 // request for new nodes that have not been yet fulfilled. Delta should be negative.
 // It is assumed that cloud provider will not delete the existing nodes if the size
 // when there is an option to just decrease the target.
-func (cluster *cluster) DecreaseTargetSize(delta int) error {
+func (asg *asg) DecreaseTargetSize(delta int) error {
 	return errors.NewAutoscalerError(errors.CloudProviderError, "CloudProvider does not support DecreaseTargetSize")
 }
 
 // Belongs returns true if the given node belongs to the NodeGroup.
-func (cluster *cluster) Belongs(node *apiv1.Node) (bool, error) {
+func (asg *asg) Belongs(node *apiv1.Node) (bool, error) {
 	// fmt.Println("Belongs : ")
-	for _, n := range cluster.VMs {
-		if n.Id == node.Status.NodeInfo.SystemUUID { // || n.Id == node.Name || n.Name == node.Name {
+	for _, instance := range asg.instances {
+		if instance.Id == node.Status.NodeInfo.SystemUUID { // || n.Id == node.Name || n.Name == node.Name {
 			return true, nil
 		}
 	}
@@ -111,67 +115,55 @@ func (cluster *cluster) Belongs(node *apiv1.Node) (bool, error) {
 }
 
 // DeleteNodes deletes the nodes from the group.
-func (cluster *cluster) DeleteNodes(nodes []*apiv1.Node) error {
+func (asg *asg) DeleteNodes(nodes []*apiv1.Node) error {
 	b, _ := json.Marshal(nodes)
 	fmt.Println("DeleteNodes : ", string(b))
 
-	if cluster.Currentsize <= cluster.Minsize {
-		return fmt.Errorf("min size reached, nodes will not be deleted")
+	if asg.currentSize <= asg.minSize {
+		return fmt.Errorf("Min size reached. Can not delete %v nodes", len(nodes))
 	}
-	size, err := cluster.manager.deleteNodes(nodes)
-	if err != nil {
-		return err
-	}
-	cluster.Currentsize = size
-	return nil
+	_, err := asg.manager.deleteNodes(nodes)
+	return err
 }
 
 // Id returns cluster id.
-func (cluster *cluster) Id() string {
-	return cluster.UUID
+func (asg *asg) Id() string {
+	return asg.uuid
 }
 
 // Debug returns cluster id.
-func (cluster *cluster) Debug() string {
-	return fmt.Sprintf("Debug : %s (%d:%d)", cluster.Id(), cluster.MinSize(), cluster.MaxSize())
+func (asg *asg) Debug() string {
+	return fmt.Sprintf("Debug : %s [%d : %d]", asg.uuid, asg.minSize, asg.maxSize)
 }
 
 // TemplateNodeInfo returns a node template for this node group.
-func (cluster *cluster) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+func (asg *asg) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
 // Exist checks if the node group really exists on the cloud provider side. Allows to tell the
 // theoretical node group from the real one.
-func (cluster *cluster) Exist() bool {
+func (asg *asg) Exist() bool {
 	return true
 }
 
 // Create creates the node group on the cloud provider side.
-func (cluster *cluster) Create() (cloudprovider.NodeGroup, error) {
+func (asg *asg) Create() (cloudprovider.NodeGroup, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
 // Autoprovisioned returns true if the node group is autoprovisioned.
-func (cluster *cluster) Autoprovisioned() bool {
+func (asg *asg) Autoprovisioned() bool {
 	return false
 }
 
 // Delete deletes the node group on the cloud provider side.
 // This will be executed only for autoprovisioned node groups, once their size drops to 0.
-func (cluster *cluster) Delete() error {
+func (asg *asg) Delete() error {
 	return cloudprovider.ErrNotImplemented
 }
 
 // Nodes returns a list of all nodes that belong to this node group.
-func (cluster *cluster) Nodes() ([]cloudprovider.Instance, error) {
-	instances := make([]cloudprovider.Instance, cluster.Currentsize)
-	for i := 0; i < cluster.Currentsize; i++ {
-		instances[i] = cloudprovider.Instance{
-			Id: cluster.VMs[i].Id,
-			// Status: cluster.VMs[i].State,
-		}
-	}
-	fmt.Println("Returning Nodes : ", instances)
-	return instances, nil
+func (asg *asg) Nodes() ([]cloudprovider.Instance, error) {
+	return asg.instances, nil
 }
